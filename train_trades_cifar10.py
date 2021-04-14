@@ -7,9 +7,10 @@ import torch.nn.functional as F
 import torchvision
 import torch.optim as optim
 from torchvision import datasets, transforms
-
+from torch.utils.tensorboard import SummaryWriter
 from models.wideresnet import *
 from models.resnet import *
+from models.resnet_dann import *
 from trades import trades_loss
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR TRADES Adversarial Training')
@@ -43,18 +44,22 @@ parser.add_argument('--model-dir', default='./model-cifar-wideResNet',
                     help='directory of model for saving checkpoint')
 parser.add_argument('--save-freq', '-s', default=1, type=int, metavar='N',
                     help='save frequency')
-
+parser.add_argument('--model', default='wideresnet')
+parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
 
 # settings
 model_dir = args.model_dir
+log_dir = 'runs/resnet_dann'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
 if not os.path.exists(model_dir):
     os.makedirs(model_dir)
 use_cuda = not args.no_cuda and torch.cuda.is_available()
 torch.manual_seed(args.seed)
-device = torch.device("cuda" if use_cuda else "cpu")
+device = torch.device("cuda:{}".format(args.gpu))
 kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-
+logger = SummaryWriter(log_dir)
 # setup data loader
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
@@ -64,9 +69,9 @@ transform_train = transforms.Compose([
 transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
-trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
+trainset = torchvision.datasets.CIFAR10(root='/nobackup/richard/dataset', train=True, download=False, transform=transform_train)
 train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, **kwargs)
-testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
+testset = torchvision.datasets.CIFAR10(root='/nobackup/richard/dataset', train=False, download=False, transform=transform_test)
 test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
 
 
@@ -89,12 +94,14 @@ def train(args, model, device, train_loader, optimizer, epoch):
         loss.backward()
         optimizer.step()
 
+        global_step = epoch * len(train_loader) + batch_idx
+        logger.add_scalar("TRADES_loss", loss, global_step)
+
         # print progress
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                        100. * batch_idx / len(train_loader), loss.item()))
-
 
 def eval_train(model, device, train_loader):
     model.eval()
@@ -149,7 +156,11 @@ def adjust_learning_rate(optimizer, epoch):
 
 def main():
     # init model, ResNet18() can be also used here for training
-    model = WideResNet().to(device)
+    if args.model == 'resnet_dann':
+        net = ResNetCifar(26, 1, channels=3, classes=10, norm_layer=nn.BatchNorm2d).to(device)
+        model = DANNWrapper(net).to(device)
+    else:
+        model = WideResNet().to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     for epoch in range(1, args.epochs + 1):
@@ -161,8 +172,12 @@ def main():
 
         # evaluation on natural examples
         print('================================================================')
-        eval_train(model, device, train_loader)
-        eval_test(model, device, test_loader)
+        train_loss, train_accuracy = eval_train(model, device, train_loader)
+        test_loss, test_accuracy = eval_test(model, device, test_loader)
+        logger.add_scalar("Train_loss", train_loss, epoch)
+        logger.add_scalar("Train_accr", train_accuracy, epoch)
+        logger.add_scalar("Test_loss", test_loss, epoch)
+        logger.add_scalar("Test_accr", test_accuracy, epoch)
         print('================================================================')
 
         # save checkpoint
